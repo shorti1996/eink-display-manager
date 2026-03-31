@@ -21,6 +21,7 @@ from homeassistant.helpers.selector import selector
 
 from .const import (
     CONF_BACKGROUND,
+    CONF_COMPRESS,
     CONF_DEBOUNCE,
     CONF_DITHER,
     CONF_ENTITY_ID,
@@ -110,6 +111,9 @@ def _reconfigure_schema(data: dict) -> vol.Schema:
                 }
             ),
             vol.Required(
+                CONF_COMPRESS, default=data.get(CONF_COMPRESS, True)
+            ): selector({"boolean": {}}),
+            vol.Required(
                 CONF_UPDATE_INTERVAL,
                 default=int(data.get(CONF_UPDATE_INTERVAL, 30)),
             ): selector({"number": {"min": 0, "max": 1440, "mode": "box"}}),
@@ -148,6 +152,7 @@ def _make_subentry_data(
         CONF_BACKGROUND: "white",
         CONF_ROTATE: 0,
         CONF_DITHER: "none",
+        CONF_COMPRESS: True,
         CONF_UPDATE_INTERVAL: 30,
         CONF_TRIGGER_ENTITIES: [],
         CONF_DEBOUNCE: 60,
@@ -303,6 +308,7 @@ class ProfileSubentryFlowHandler(ConfigSubentryFlow):
             coord.dither = self._options.get(CONF_DITHER, coord.dither)
             coord.retry_delay = int(self._options.get(CONF_RETRY_DELAY, coord.retry_delay))
             coord.retry_count = int(self._options.get(CONF_RETRY_COUNT, coord.retry_count))
+            coord.compress = self._options.get(CONF_COMPRESS, coord.compress)
 
         return self.async_update_and_abort(
             entry,

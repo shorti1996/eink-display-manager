@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 from .const import (
     CONF_BACKGROUND,
+    CONF_COMPRESS,
     CONF_DEBOUNCE,
     CONF_DITHER,
     CONF_ENTITY_ID,
@@ -91,6 +92,7 @@ class ProfileCoordinator:
         self.debounce_seconds: int = int(data.get(CONF_DEBOUNCE, 60))
         self.retry_delay: int = int(data.get(CONF_RETRY_DELAY, 5))
         self.retry_count: int = int(data.get(CONF_RETRY_COUNT, 3))
+        self.compress: bool = bool(data.get(CONF_COMPRESS, True))
 
         # Hot data — payload loaded later via async_load_payload()
         self.payload_template: list[dict] = []
@@ -324,6 +326,7 @@ class ProfileCoordinator:
                             "background": self.background,
                             "rotate": self.rotate,
                             "dither": self.dither,
+                            "compress": self.compress,
                             "dry_run": False,
                         },
                         blocking=True,

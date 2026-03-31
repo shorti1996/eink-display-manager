@@ -45,6 +45,7 @@
             "background": "Background color",
             "rotate": "Rotation",
             "dither": "Dithering algorithm",
+            "compress": "Block compression",
             "update_interval_minutes": "Update interval (minutes, 0 = disabled)",
             "trigger_entities": "Additional trigger entities",
             "trigger_debounce_seconds": "Debounce (seconds)",
@@ -52,6 +53,7 @@
             "retry_count": "Max retries after failure"
           },
           "data_description": {
+            "compress": "Compress image data before BLE transfer (faster for most images)",
             "update_interval_minutes": "How often to re-render and send to the display. Set to 0 to disable periodic updates.",
             "trigger_entities": "Entities in Jinja2 templates are tracked automatically. Add extra triggers here (e.g. a motion sensor not referenced in the layout).",
             "trigger_debounce_seconds": "Wait this long after the last entity change before rendering. Prevents rapid re-sends.",

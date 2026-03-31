@@ -24,6 +24,7 @@ from homeassistant.helpers.event import async_call_later
 
 from .const import (
     CONF_BACKGROUND,
+    CONF_COMPRESS,
     CONF_DEBOUNCE,
     CONF_DITHER,
     CONF_ENTITY_ID,
@@ -566,6 +567,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 "trigger_debounce_seconds": int(
                     data.get(CONF_DEBOUNCE, 60)
                 ),
+                "compress": bool(data.get(CONF_COMPRESS, True)),
             },
         )
 
@@ -651,6 +653,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 CONF_BACKGROUND: "white",
                 CONF_ROTATE: 0,
                 CONF_DITHER: "none",
+                CONF_COMPRESS: True,
                 CONF_UPDATE_INTERVAL: 30,
                 CONF_TRIGGER_ENTITIES: [],
                 CONF_DEBOUNCE: 60,
@@ -692,6 +695,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
             vol.Optional("dither"): str,
             vol.Optional("background"): str,
             vol.Optional("rotate"): int,
+            vol.Optional("compress"): bool,
         }
     )
     @websocket_api.async_response
@@ -707,7 +711,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
         # Build updated data dict from current + overrides
         new_data = dict(subentry.data)
         changed = False
-        for key in (CONF_DITHER, CONF_BACKGROUND, CONF_ROTATE):
+        for key in (CONF_DITHER, CONF_BACKGROUND, CONF_ROTATE, CONF_COMPRESS):
             if key in msg and msg[key] != new_data.get(key):
                 new_data[key] = msg[key]
                 changed = True
@@ -727,6 +731,8 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 coord.background = msg[CONF_BACKGROUND]
             if CONF_ROTATE in msg:
                 coord.rotate = msg[CONF_ROTATE]
+            if CONF_COMPRESS in msg:
+                coord.compress = msg[CONF_COMPRESS]
 
         # Persist via programmatic reconfigure flow
         try:

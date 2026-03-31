@@ -35,5 +35,6 @@ CONF_DEBOUNCE = "trigger_debounce_seconds"
 CONF_ENABLED = "enabled"
 CONF_RETRY_DELAY = "retry_delay"
 CONF_RETRY_COUNT = "retry_count"
+CONF_COMPRESS = "compress"
 
 PLATFORMS = ["sensor", "button", "switch"]
