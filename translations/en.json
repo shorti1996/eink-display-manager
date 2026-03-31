@@ -1,0 +1,69 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "E-Ink Display Manager",
+        "description": "Select the display for your first profile. You can add more displays later.",
+        "data": {
+          "entity_id": "Display entity"
+        },
+        "data_description": {
+          "entity_id": "The image entity representing your e-ink display"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "E-Ink Display Manager is already configured."
+    }
+  },
+  "options": {
+    "abort": {
+      "no_options": "Use the + button to add display profiles, or click the gear icon on a specific profile to edit its settings."
+    }
+  },
+  "config_subentries": {
+    "profile": {
+      "title": "Display profile",
+      "initiate_flow": {
+        "user": "Add display profile"
+      },
+      "step": {
+        "user": {
+          "title": "Add display profile",
+          "description": "Select the image entity for your e-ink display. Display dimensions and service will be detected automatically.",
+          "data": {
+            "entity_id": "Display entity"
+          },
+          "data_description": {
+            "entity_id": "The image entity representing your e-ink display (e.g. image.wolink_esl_...)"
+          }
+        },
+        "set_options": {
+          "title": "Edit display profile",
+          "description": "Update rendering and schedule settings for this profile.",
+          "data": {
+            "background": "Background color",
+            "rotate": "Rotation",
+            "dither": "Dithering algorithm",
+            "update_interval_minutes": "Update interval (minutes, 0 = disabled)",
+            "trigger_entities": "Additional trigger entities",
+            "trigger_debounce_seconds": "Debounce (seconds)",
+            "retry_delay": "Retry delay (minutes)",
+            "retry_count": "Max retries after failure"
+          },
+          "data_description": {
+            "update_interval_minutes": "How often to re-render and send to the display. Set to 0 to disable periodic updates.",
+            "trigger_entities": "Entities in Jinja2 templates are tracked automatically. Add extra triggers here (e.g. a motion sensor not referenced in the layout).",
+            "trigger_debounce_seconds": "Wait this long after the last entity change before rendering. Prevents rapid re-sends.",
+            "retry_delay": "Minutes to wait before retrying a failed update.",
+            "retry_count": "Number of automatic retries after failure (0 = disabled)."
+          }
+        }
+      },
+      "abort": {
+        "entry_not_loaded": "The integration is not loaded. Please reload it first.",
+        "reconfigure_successful": "Profile updated successfully."
+      }
+    }
+  }
+}

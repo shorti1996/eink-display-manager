@@ -1,0 +1,11 @@
+refresh:
+  name: Refresh Display
+  description: Force an immediate update of a managed display profile
+  target:
+    entity:
+      integration: eink_display_manager
+      domain: button
+
+refresh_all:
+  name: Refresh All Displays
+  description: Force an immediate update of all enabled display profiles
