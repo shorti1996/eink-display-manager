@@ -15,6 +15,15 @@ _LOGGER = logging.getLogger(__name__)
 
 # Compiled JS lives in the www/ sibling directory, not in frontend/ itself.
 _WWW_DIR = Path(__file__).parent.parent / "www"
+_FONTS_DIR = Path(__file__).parent.parent / "fonts"
+
+_FONT_FILES = (
+    "rbm.ttf",
+    "ppb.ttf",
+    "DejaVuSans.ttf",
+    "materialdesignicons-webfont.ttf",
+    "materialdesignicons-webfont_meta.json",
+)
 
 
 class JSModuleRegistration:
@@ -32,11 +41,20 @@ class JSModuleRegistration:
             await self._async_wait_for_lovelace_resources()
 
     async def _async_register_static_path(self) -> None:
-        """Serve the www/ directory at URL_BASE."""
+        """Serve www/ and fonts/ at URL_BASE."""
+        paths = [StaticPathConfig(URL_BASE, str(_WWW_DIR), False)]
+        for font_file in _FONT_FILES:
+            font_path = _FONTS_DIR / font_file
+            if font_path.is_file():
+                paths.append(
+                    StaticPathConfig(
+                        f"{URL_BASE}/fonts/{font_file}",
+                        str(font_path),
+                        True,
+                    )
+                )
         try:
-            await self.hass.http.async_register_static_paths(
-                [StaticPathConfig(URL_BASE, str(_WWW_DIR), False)]
-            )
+            await self.hass.http.async_register_static_paths(paths)
             _LOGGER.debug("Registered static path: %s", URL_BASE)
         except RuntimeError:
             _LOGGER.debug("Static path already registered: %s", URL_BASE)
