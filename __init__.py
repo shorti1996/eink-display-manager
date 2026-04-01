@@ -29,8 +29,11 @@ from .const import (
     CONF_DITHER,
     CONF_ENTITY_ID,
     CONF_HEIGHT,
+    CONF_MIRROR,
     CONF_NAME,
     CONF_PAYLOAD_JSON,
+    CONF_RETRY_COUNT,
+    CONF_RETRY_DELAY,
     CONF_ROTATE,
     CONF_SERVICE,
     CONF_TRIGGER_ENTITIES,
@@ -413,25 +416,36 @@ def _register_services(hass: HomeAssistant) -> None:
 # ─── WebSocket API for editor card ────────────────────────────────────
 
 
+_RECONFIGURE_KEYS = {
+    CONF_BACKGROUND, CONF_ROTATE, CONF_DITHER, CONF_COMPRESS, CONF_MIRROR,
+    CONF_UPDATE_INTERVAL, CONF_TRIGGER_ENTITIES, CONF_DEBOUNCE,
+    CONF_RETRY_DELAY, CONF_RETRY_COUNT,
+}
+
+
 async def _async_persist_subentry_data(
     hass: HomeAssistant, entry: ConfigEntry, subentry: Any, new_data: dict
 ) -> None:
     """Persist updated subentry data via programmatic reconfigure flow.
 
     Handles coercion (rotate int→str) required by the form schema.
+    Only passes keys accepted by _reconfigure_schema to avoid validation errors.
     """
-    form_data = dict(new_data)
+    form_data = {k: v for k, v in new_data.items() if k in _RECONFIGURE_KEYS}
     # The reconfigure form schema expects rotate as a string (select selector)
     if CONF_ROTATE in form_data:
         form_data[CONF_ROTATE] = str(form_data[CONF_ROTATE])
+    _LOGGER.debug("Persisting profile settings: %s", form_data)
     result = await hass.config_entries.subentries.async_init(
         (entry.entry_id, "profile"),
         context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
     )
+    _LOGGER.debug("Reconfigure init result type: %s", result.get("type"))
     if result.get("type") == "form":
-        await hass.config_entries.subentries.async_configure(
+        result2 = await hass.config_entries.subentries.async_configure(
             result["flow_id"], form_data
         )
+        _LOGGER.debug("Reconfigure configure result type: %s", result2.get("type") if result2 else None)
 
 
 def _resolve_subentry(hass: HomeAssistant, msg: dict) -> tuple[Any, Any]:
@@ -568,6 +582,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                     data.get(CONF_DEBOUNCE, 60)
                 ),
                 "compress": bool(data.get(CONF_COMPRESS, True)),
+                "mirror": data.get(CONF_MIRROR, "none"),
             },
         )
 
@@ -654,6 +669,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 CONF_ROTATE: 0,
                 CONF_DITHER: "none",
                 CONF_COMPRESS: True,
+                CONF_MIRROR: "none",
                 CONF_UPDATE_INTERVAL: 30,
                 CONF_TRIGGER_ENTITIES: [],
                 CONF_DEBOUNCE: 60,
@@ -696,6 +712,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
             vol.Optional("background"): str,
             vol.Optional("rotate"): int,
             vol.Optional("compress"): bool,
+            vol.Optional("mirror"): str,
         }
     )
     @websocket_api.async_response
@@ -711,7 +728,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
         # Build updated data dict from current + overrides
         new_data = dict(subentry.data)
         changed = False
-        for key in (CONF_DITHER, CONF_BACKGROUND, CONF_ROTATE, CONF_COMPRESS):
+        for key in (CONF_DITHER, CONF_BACKGROUND, CONF_ROTATE, CONF_COMPRESS, CONF_MIRROR):
             if key in msg and msg[key] != new_data.get(key):
                 new_data[key] = msg[key]
                 changed = True
@@ -733,6 +750,8 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 coord.rotate = msg[CONF_ROTATE]
             if CONF_COMPRESS in msg:
                 coord.compress = msg[CONF_COMPRESS]
+            if CONF_MIRROR in msg:
+                coord.mirror = msg[CONF_MIRROR]
 
         # Persist via programmatic reconfigure flow
         try:

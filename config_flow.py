@@ -24,6 +24,7 @@ from .const import (
     CONF_COMPRESS,
     CONF_DEBOUNCE,
     CONF_DITHER,
+    CONF_MIRROR,
     CONF_ENTITY_ID,
     CONF_HEIGHT,
     CONF_RETRY_COUNT,
@@ -114,6 +115,11 @@ def _reconfigure_schema(data: dict) -> vol.Schema:
                 CONF_COMPRESS, default=data.get(CONF_COMPRESS, True)
             ): selector({"boolean": {}}),
             vol.Required(
+                CONF_MIRROR, default=data.get(CONF_MIRROR, "none")
+            ): selector(
+                {"select": {"options": ["none", "horizontal", "vertical"]}}
+            ),
+            vol.Required(
                 CONF_UPDATE_INTERVAL,
                 default=int(data.get(CONF_UPDATE_INTERVAL, 30)),
             ): selector({"number": {"min": 0, "max": 1440, "mode": "box"}}),
@@ -153,6 +159,7 @@ def _make_subentry_data(
         CONF_ROTATE: 0,
         CONF_DITHER: "none",
         CONF_COMPRESS: True,
+        CONF_MIRROR: "none",
         CONF_UPDATE_INTERVAL: 30,
         CONF_TRIGGER_ENTITIES: [],
         CONF_DEBOUNCE: 60,
@@ -309,6 +316,13 @@ class ProfileSubentryFlowHandler(ConfigSubentryFlow):
             coord.retry_delay = int(self._options.get(CONF_RETRY_DELAY, coord.retry_delay))
             coord.retry_count = int(self._options.get(CONF_RETRY_COUNT, coord.retry_count))
             coord.compress = self._options.get(CONF_COMPRESS, coord.compress)
+            coord.mirror = self._options.get(CONF_MIRROR, coord.mirror)
+
+        # Notify frontend cards that profile settings changed
+        self.hass.bus.async_fire(
+            "eink_display_manager_profile_updated",
+            {"subentry_id": subentry.subentry_id},
+        )
 
         return self.async_update_and_abort(
             entry,

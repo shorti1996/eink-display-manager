@@ -31,6 +31,7 @@ from .const import (
     CONF_COMPRESS,
     CONF_DEBOUNCE,
     CONF_DITHER,
+    CONF_MIRROR,
     CONF_ENTITY_ID,
     CONF_RETRY_COUNT,
     CONF_RETRY_DELAY,
@@ -93,6 +94,7 @@ class ProfileCoordinator:
         self.retry_delay: int = int(data.get(CONF_RETRY_DELAY, 5))
         self.retry_count: int = int(data.get(CONF_RETRY_COUNT, 3))
         self.compress: bool = bool(data.get(CONF_COMPRESS, True))
+        self.mirror: str = data.get(CONF_MIRROR, "none")
 
         # Hot data — payload loaded later via async_load_payload()
         self.payload_template: list[dict] = []
@@ -304,7 +306,8 @@ class ProfileCoordinator:
                 resolved = _resolve_templates(self.hass, copy.deepcopy(self.payload_template))
 
                 hash_input = json.dumps(
-                    {"payload": resolved, "bg": self.background, "r": self.rotate, "d": self.dither},
+                    {"payload": resolved, "bg": self.background, "r": self.rotate,
+                     "d": self.dither, "c": self.compress, "m": self.mirror},
                     sort_keys=True,
                     ensure_ascii=False,
                 )
@@ -327,6 +330,7 @@ class ProfileCoordinator:
                             "rotate": self.rotate,
                             "dither": self.dither,
                             "compress": self.compress,
+                            **({"mirror": self.mirror} if self.mirror and self.mirror != "none" else {}),
                             "dry_run": False,
                         },
                         blocking=True,

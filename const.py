@@ -36,5 +36,6 @@ CONF_ENABLED = "enabled"
 CONF_RETRY_DELAY = "retry_delay"
 CONF_RETRY_COUNT = "retry_count"
 CONF_COMPRESS = "compress"
+CONF_MIRROR = "mirror"
 
 PLATFORMS = ["sensor", "button", "switch"]
