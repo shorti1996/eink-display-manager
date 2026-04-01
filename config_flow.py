@@ -25,9 +25,9 @@ from .const import (
     CONF_DEBOUNCE,
     CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
-    CONF_MIRROR,
     CONF_ENTITY_ID,
     CONF_HEIGHT,
+    CONF_MIRROR,
     CONF_RETRY_COUNT,
     CONF_RETRY_DELAY,
     CONF_ROTATE,
@@ -37,22 +37,6 @@ from .const import (
     CONF_WIDTH,
     DOMAIN,
 )
-
-_ENTITY_DEBOUNCE_SCHEMA = vol.Any(
-    vol.Coerce(float),
-    vol.Schema({
-        vol.Required("cooldown"): vol.Coerce(float),
-        vol.Optional("max_wait"): vol.Coerce(float),
-    }),
-)
-
-_DEBOUNCE_CONFIG_SCHEMA = vol.Schema({
-    vol.Required("default", default=60): vol.Coerce(float),
-    vol.Required("global", default=5): vol.Coerce(float),
-    vol.Optional("entities", default={}): {str: _ENTITY_DEBOUNCE_SCHEMA},
-    vol.Optional("ignored", default=[]): [str],
-})
-
 
 # ─── Helper functions ────────────────────────────────────────────────
 
@@ -152,7 +136,6 @@ def _reconfigure_schema(data: dict) -> vol.Schema:
             vol.Required(
                 CONF_RETRY_COUNT, default=int(data.get(CONF_RETRY_COUNT, 3))
             ): selector({"number": {"min": 0, "max": 10, "mode": "box"}}),
-            vol.Optional(CONF_DEBOUNCE_CONFIG): _DEBOUNCE_CONFIG_SCHEMA,
         }
     )
 
