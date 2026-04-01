@@ -23,6 +23,7 @@ from .const import (
     CONF_BACKGROUND,
     CONF_COMPRESS,
     CONF_DEBOUNCE,
+    CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
     CONF_MIRROR,
     CONF_ENTITY_ID,
@@ -36,6 +37,21 @@ from .const import (
     CONF_WIDTH,
     DOMAIN,
 )
+
+_ENTITY_DEBOUNCE_SCHEMA = vol.Any(
+    vol.Coerce(float),
+    vol.Schema({
+        vol.Required("cooldown"): vol.Coerce(float),
+        vol.Optional("max_wait"): vol.Coerce(float),
+    }),
+)
+
+_DEBOUNCE_CONFIG_SCHEMA = vol.Schema({
+    vol.Required("default", default=60): vol.Coerce(float),
+    vol.Required("global", default=5): vol.Coerce(float),
+    vol.Optional("entities", default={}): {str: _ENTITY_DEBOUNCE_SCHEMA},
+    vol.Optional("ignored", default=[]): [str],
+})
 
 
 # ─── Helper functions ────────────────────────────────────────────────
@@ -136,6 +152,7 @@ def _reconfigure_schema(data: dict) -> vol.Schema:
             vol.Required(
                 CONF_RETRY_COUNT, default=int(data.get(CONF_RETRY_COUNT, 3))
             ): selector({"number": {"min": 0, "max": 10, "mode": "box"}}),
+            vol.Optional(CONF_DEBOUNCE_CONFIG): _DEBOUNCE_CONFIG_SCHEMA,
         }
     )
 
@@ -163,6 +180,7 @@ def _make_subentry_data(
         CONF_UPDATE_INTERVAL: 30,
         CONF_TRIGGER_ENTITIES: [],
         CONF_DEBOUNCE: 60,
+        CONF_DEBOUNCE_CONFIG: {"default": 60, "global": 5, "entities": {}, "ignored": []},
         CONF_RETRY_DELAY: 5,
         CONF_RETRY_COUNT: 3,
     }

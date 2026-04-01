@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import callback
+from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
@@ -30,6 +31,7 @@ from .const import (
     CONF_BACKGROUND,
     CONF_COMPRESS,
     CONF_DEBOUNCE,
+    CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
     CONF_MIRROR,
     CONF_ENTITY_ID,
@@ -69,6 +71,68 @@ def _extract_template_strings(payload: list[dict]) -> list[str]:
     return list(dict.fromkeys(templates))
 
 
+class BoundedDebouncer:
+    """Debouncer with max_wait to prevent starvation from rapid updates.
+
+    Normal case: entity settles within cooldown -> fires on trailing edge.
+    Starvation case: entity keeps updating past max_wait -> force fire, reset cycle.
+    """
+
+    def __init__(
+        self, hass, logger, *, cooldown: float, max_wait: float | None = None,
+        function=None,
+    ):
+        self.hass = hass
+        self._max_wait = max_wait if max_wait is not None else cooldown * 3
+        self._first_trigger: float | None = None
+        self._max_wait_handle: asyncio.TimerHandle | None = None
+        self._function = function
+        self._inner = Debouncer(
+            hass, logger, cooldown=cooldown, immediate=False,
+            function=self._on_inner_fire,
+        )
+
+    async def _on_inner_fire(self):
+        """Inner debouncer fired normally -- clean up max_wait timer and call target."""
+        if self._first_trigger is None:
+            return
+        if self._max_wait_handle:
+            self._max_wait_handle.cancel()
+            self._max_wait_handle = None
+        self._first_trigger = None
+        if self._function:
+            await self._function()
+
+    @callback
+    def async_schedule_call(self):
+        if self._first_trigger is None:
+            self._first_trigger = self.hass.loop.time()
+            self._max_wait_handle = self.hass.loop.call_later(
+                self._max_wait, self._force_fire,
+            )
+        self._inner.async_schedule_call()
+
+    @callback
+    def _force_fire(self):
+        """max_wait exceeded -- force fire and reset cycle."""
+        self._inner.async_cancel()
+        self._first_trigger = None
+        self._max_wait_handle = None
+        if self._function:
+            self.hass.async_create_task(self._function())
+
+    @callback
+    def async_cancel(self):
+        self._inner.async_cancel()
+        self._first_trigger = None
+        if self._max_wait_handle:
+            self._max_wait_handle.cancel()
+            self._max_wait_handle = None
+
+
+_DEBOUNCE_DEFAULTS = {"default": 60, "global": 5, "entities": {}, "ignored": []}
+
+
 class ProfileCoordinator:
     """Manages trigger lifecycle and dispatches updates for one display profile."""
 
@@ -90,7 +154,15 @@ class ProfileCoordinator:
         self.dither: str = data.get(CONF_DITHER, "none")
         self.update_interval: int = int(data.get(CONF_UPDATE_INTERVAL, 0))
         self.trigger_entities: list[str] = list(data.get(CONF_TRIGGER_ENTITIES, []))
-        self.debounce_seconds: int = int(data.get(CONF_DEBOUNCE, 60))
+
+        # Two-tier debounce config
+        debounce_config = data.get(CONF_DEBOUNCE_CONFIG)
+        if debounce_config is None:
+            old_debounce = int(data.get(CONF_DEBOUNCE, 60))
+            debounce_config = {**_DEBOUNCE_DEFAULTS, "default": old_debounce}
+        else:
+            debounce_config = {**_DEBOUNCE_DEFAULTS, **debounce_config}
+        self._debounce_config: dict = debounce_config
         self.retry_delay: int = int(data.get(CONF_RETRY_DELAY, 5))
         self.retry_count: int = int(data.get(CONF_RETRY_COUNT, 3))
         self.compress: bool = bool(data.get(CONF_COMPRESS, True))
@@ -110,7 +182,9 @@ class ProfileCoordinator:
         self._unsub_interval: CALLBACK_TYPE | None = None
         self._unsub_template_track: CALLBACK_TYPE | None = None
         self._unsub_entities: list[CALLBACK_TYPE] = []
-        self._debounce_task: asyncio.Task | None = None
+        self._entity_debouncers: dict[str, BoundedDebouncer] = {}
+        self._global_debouncer: Debouncer | None = None
+        self._template_track_info = None
         self._template_init_done: bool = False
         self._update_lock = asyncio.Lock()
         self._send_task: asyncio.Task | None = None
@@ -165,6 +239,15 @@ class ProfileCoordinator:
         await self.async_stop()
         if not self.enabled:
             return
+
+        # Global gate: leading-edge debouncer
+        self._global_debouncer = Debouncer(
+            self.hass, _LOGGER,
+            cooldown=self._debounce_config.get("global", 5),
+            immediate=True,
+            function=self._async_execute_update,
+        )
+
         if self.update_interval and self.update_interval > 0:
             self._unsub_interval = async_track_time_interval(
                 self.hass,
@@ -186,6 +269,7 @@ class ProfileCoordinator:
                 self._on_template_change,
             )
             self._unsub_template_track = info.async_remove
+            self._template_track_info = info
             info.async_refresh()
 
         # Additional manual trigger entities (for entities not in templates)
@@ -206,12 +290,16 @@ class ProfileCoordinator:
         if self._unsub_template_track:
             self._unsub_template_track()
             self._unsub_template_track = None
+        self._template_track_info = None
         for unsub in self._unsub_entities:
             unsub()
         self._unsub_entities.clear()
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-            self._debounce_task = None
+        for debouncer in self._entity_debouncers.values():
+            debouncer.async_cancel()
+        self._entity_debouncers.clear()
+        if self._global_debouncer:
+            self._global_debouncer.async_cancel()
+            self._global_debouncer = None
         if self._retry_unsub:
             self._retry_unsub()
             self._retry_unsub = None
@@ -232,37 +320,90 @@ class ProfileCoordinator:
         if all(u.last_result == u.result for u in updates):
             _LOGGER.debug("Profile %s: template deps fired but outputs unchanged", self.title)
             return
-        changed = [
-            f"{u.template.template}: {u.last_result!r} -> {u.result!r}"
-            for u in updates
-            if u.last_result != u.result
-        ]
-        _LOGGER.debug(
-            "Profile %s: %d template(s) changed: %s",
-            self.title, len(changed), "; ".join(changed),
-        )
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-        self._debounce_task = self.hass.async_create_task(
-            self._debounced_update("template_dep"),
-        )
 
-    async def _on_entity_change(self, event: Event) -> None:
-        """Handle entity state change with debounce."""
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-        entity_id = event.data.get("entity_id", "unknown")
-        self._debounce_task = self.hass.async_create_task(
-            self._debounced_update(f"entity:{entity_id}"),
-        )
+        if event is None:
+            # Initial render -- bypass debounce
+            self.hass.async_create_task(self._async_execute_update())
+            return
 
-    async def _debounced_update(self, reason: str) -> None:
-        """Wait for debounce period, then trigger update."""
-        try:
-            await asyncio.sleep(self.debounce_seconds)
-            await self.async_trigger_update(reason)
-        except asyncio.CancelledError:
-            pass
+        entity_id = event.data.get("entity_id")
+        if not entity_id:
+            return
+        if entity_id in self._debounce_config.get("ignored", []):
+            _LOGGER.debug("Profile %s: ignoring change from %s", self.title, entity_id)
+            return
+
+        debouncer = self._get_or_create_entity_debouncer(entity_id)
+        debouncer.async_schedule_call()
+
+    @callback
+    def _on_entity_change(self, event: Event) -> None:
+        """Handle entity state change — route through per-entity debouncer."""
+        entity_id = event.data.get("entity_id")
+        if not entity_id:
+            return
+        if entity_id in self._debounce_config.get("ignored", []):
+            _LOGGER.debug("Profile %s: ignoring change from %s", self.title, entity_id)
+            return
+        debouncer = self._get_or_create_entity_debouncer(entity_id)
+        debouncer.async_schedule_call()
+
+    def _get_or_create_entity_debouncer(self, entity_id: str) -> BoundedDebouncer:
+        if entity_id in self._entity_debouncers:
+            return self._entity_debouncers[entity_id]
+
+        entity_cfg = self._debounce_config.get("entities", {}).get(entity_id)
+        if isinstance(entity_cfg, dict):
+            cooldown = entity_cfg.get("cooldown", self._debounce_config.get("default", 5))
+            max_wait = entity_cfg.get("max_wait")
+        elif isinstance(entity_cfg, (int, float)):
+            cooldown = entity_cfg
+            max_wait = None
+        else:
+            cooldown = self._debounce_config.get("default", 5)
+            max_wait = None
+
+        debouncer = BoundedDebouncer(
+            self.hass, _LOGGER,
+            cooldown=cooldown,
+            max_wait=max_wait,
+            function=self._async_request_global_refresh,
+        )
+        self._entity_debouncers[entity_id] = debouncer
+        return debouncer
+
+    async def _async_request_global_refresh(self):
+        """Per-entity debouncer fires here -- route through global gate."""
+        if self._global_debouncer:
+            await self._global_debouncer.async_call()
+
+    async def _async_execute_update(self):
+        """Global debouncer fires here -- the only place expensive work happens."""
+        await self.async_trigger_update("debounced")
+
+    def get_tracked_entities(self) -> set[str]:
+        """Return entity IDs this profile depends on (templates + manual triggers)."""
+        entities: set[str] = set()
+        if self._template_track_info:
+            listeners = self._template_track_info.listeners
+            entities.update(listeners.get("entities", set()))
+        entities.update(self.trigger_entities)
+        return entities
+
+    def update_debounce_config(self, config: dict) -> None:
+        """Hot-update debounce config -- cancel all pending, recreate global debouncer."""
+        self._debounce_config = {**_DEBOUNCE_DEFAULTS, **config}
+        for debouncer in self._entity_debouncers.values():
+            debouncer.async_cancel()
+        self._entity_debouncers.clear()
+        if self._global_debouncer:
+            self._global_debouncer.async_cancel()
+        self._global_debouncer = Debouncer(
+            self.hass, _LOGGER,
+            cooldown=self._debounce_config.get("global", 5),
+            immediate=True,
+            function=self._async_execute_update,
+        )
 
     def cancel_pending(self) -> None:
         """Cancel pending retries, debounced updates, and in-progress sends."""
@@ -270,9 +411,11 @@ class ProfileCoordinator:
             self._retry_unsub()
             self._retry_unsub = None
         self._retry_attempt = 0
-        if self._debounce_task and not self._debounce_task.done():
-            self._debounce_task.cancel()
-            self._debounce_task = None
+        for debouncer in self._entity_debouncers.values():
+            debouncer.async_cancel()
+        self._entity_debouncers.clear()
+        if self._global_debouncer:
+            self._global_debouncer.async_cancel()
         if self._send_task and not self._send_task.done():
             self._send_task.cancel()
             self._send_task = None

@@ -26,6 +26,7 @@ from .const import (
     CONF_BACKGROUND,
     CONF_COMPRESS,
     CONF_DEBOUNCE,
+    CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
     CONF_ENTITY_ID,
     CONF_HEIGHT,
@@ -419,7 +420,7 @@ def _register_services(hass: HomeAssistant) -> None:
 _RECONFIGURE_KEYS = {
     CONF_BACKGROUND, CONF_ROTATE, CONF_DITHER, CONF_COMPRESS, CONF_MIRROR,
     CONF_UPDATE_INTERVAL, CONF_TRIGGER_ENTITIES, CONF_DEBOUNCE,
-    CONF_RETRY_DELAY, CONF_RETRY_COUNT,
+    CONF_DEBOUNCE_CONFIG, CONF_RETRY_DELAY, CONF_RETRY_COUNT,
 }
 
 
@@ -583,6 +584,10 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 ),
                 "compress": bool(data.get(CONF_COMPRESS, True)),
                 "mirror": data.get(CONF_MIRROR, "none"),
+                "debounce_config": data.get(
+                    CONF_DEBOUNCE_CONFIG,
+                    {"default": 60, "global": 5, "entities": {}, "ignored": []},
+                ),
             },
         )
 
@@ -673,6 +678,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 CONF_UPDATE_INTERVAL: 30,
                 CONF_TRIGGER_ENTITIES: [],
                 CONF_DEBOUNCE: 60,
+                CONF_DEBOUNCE_CONFIG: {"default": 60, "global": 5, "entities": {}, "ignored": []},
             }),
             subentry_type="profile",
             title=title,
@@ -713,6 +719,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
             vol.Optional("rotate"): int,
             vol.Optional("compress"): bool,
             vol.Optional("mirror"): str,
+            vol.Optional("debounce_config"): dict,
         }
     )
     @websocket_api.async_response
@@ -733,6 +740,10 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 new_data[key] = msg[key]
                 changed = True
 
+        if "debounce_config" in msg:
+            new_data[CONF_DEBOUNCE_CONFIG] = msg["debounce_config"]
+            changed = True
+
         if not changed:
             connection.send_result(msg["id"], {"success": True})
             return
@@ -752,6 +763,8 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 coord.compress = msg[CONF_COMPRESS]
             if CONF_MIRROR in msg:
                 coord.mirror = msg[CONF_MIRROR]
+            if "debounce_config" in msg:
+                coord.update_debounce_config(msg["debounce_config"])
 
         # Persist via programmatic reconfigure flow
         try:
@@ -812,6 +825,35 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
 
         connection.send_result(msg["id"], {"success": True})
 
+    @websocket_api.websocket_command(
+        {
+            vol.Required("type"): "eink_display_manager/get_tracked_entities",
+            vol.Required("subentry_id"): str,
+        }
+    )
+    @websocket_api.async_response
+    async def ws_get_tracked_entities(
+        hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+    ) -> None:
+        """Return tracked entities and debounce config for a profile."""
+        entry, subentry = _resolve_subentry(hass, msg)
+        if entry is None or subentry is None:
+            connection.send_error(msg["id"], "not_found", "Profile not found")
+            return
+
+        coord = hass.data.get(DOMAIN, {}).get("coordinators", {}).get(
+            subentry.subentry_id
+        )
+        entities = sorted(coord.get_tracked_entities()) if coord else []
+        debounce_config = subentry.data.get(
+            CONF_DEBOUNCE_CONFIG,
+            {"default": 60, "global": 5, "entities": {}, "ignored": []},
+        )
+        connection.send_result(msg["id"], {
+            "entities": entities,
+            "debounce_config": debounce_config,
+        })
+
     websocket_api.async_register_command(hass, ws_list_profiles)
     websocket_api.async_register_command(hass, ws_get_payload)
     websocket_api.async_register_command(hass, ws_update_payload)
@@ -819,6 +861,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_resolve_templates)
     websocket_api.async_register_command(hass, ws_update_profile_settings)
     websocket_api.async_register_command(hass, ws_activate_profile)
+    websocket_api.async_register_command(hass, ws_get_tracked_entities)
 
 
 def _write_json(path: str, data: Any) -> None:

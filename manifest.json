@@ -1,7 +1,7 @@
 {
   "domain": "eink_display_manager",
   "name": "E-Ink Display Manager",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "codeowners": [],
   "config_flow": true,
   "dependencies": [
