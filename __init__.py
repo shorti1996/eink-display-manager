@@ -25,7 +25,6 @@ from homeassistant.helpers.event import async_call_later
 from .const import (
     CONF_BACKGROUND,
     CONF_COMPRESS,
-    CONF_DEBOUNCE,
     CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
     CONF_ENTITY_ID,
@@ -43,6 +42,7 @@ from .const import (
     DOMAIN,
     PLATFORMS,
 )
+from .config_flow import DEBOUNCE_CONFIG_SCHEMA
 from .coordinator import ProfileCoordinator
 from .frontend import JSModuleRegistration
 
@@ -54,6 +54,8 @@ _LOGGER = logging.getLogger(__name__)
 
 _STARTUP_RENDER_DELAY = 10     # seconds after HA started before first render
 _STARTUP_RENDER_STAGGER = 10   # seconds between successive profile renders
+# Default True. Set env EDM_SKIP_STARTUP_RENDER=1 to disable for local dev.
+_STARTUP_RENDER_ENABLED = os.getenv("EDM_SKIP_STARTUP_RENDER") != "1"
 
 
 # ─── Active‑profile persistence (file‑based) ──────────────────────────
@@ -170,7 +172,12 @@ async def _async_migrate_integration(hass: HomeAssistant) -> None:
                 CONF_DITHER: data.get(CONF_DITHER, "floyd-steinberg"),
                 CONF_UPDATE_INTERVAL: int(data.get(CONF_UPDATE_INTERVAL, 30)),
                 CONF_TRIGGER_ENTITIES: list(data.get(CONF_TRIGGER_ENTITIES, [])),
-                CONF_DEBOUNCE: int(data.get(CONF_DEBOUNCE, 60)),
+                CONF_DEBOUNCE_CONFIG: {
+                    "default": int(data.get("trigger_debounce_seconds", 60)),
+                    "global": 5,
+                    "entities": {},
+                    "ignored": [],
+                },
             }),
             subentry_type="profile",
             title=data.get(CONF_NAME, entry.title),
@@ -260,8 +267,35 @@ async def _async_migrate_integration(hass: HomeAssistant) -> None:
 # ─── Entry setup / unload ────────────────────────────────────────────
 
 
+_LEGACY_DEBOUNCE_KEY = "trigger_debounce_seconds"
+
+
+def _migrate_legacy_debounce(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    for subentry in entry.subentries.values():
+        if subentry.subentry_type != "profile":
+            continue
+        data = subentry.data
+        has_legacy = _LEGACY_DEBOUNCE_KEY in data
+        has_config = CONF_DEBOUNCE_CONFIG in data
+        if has_config and not has_legacy:
+            continue
+        new_data = {k: v for k, v in data.items() if k != _LEGACY_DEBOUNCE_KEY}
+        if not has_config:
+            new_data[CONF_DEBOUNCE_CONFIG] = {
+                "default": int(data.get(_LEGACY_DEBOUNCE_KEY, 60)),
+                "global": 5,
+                "entities": {},
+                "ignored": [],
+            }
+        hass.config_entries.async_update_subentry(entry, subentry, data=new_data)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up the singleton E-Ink Display Manager entry."""
+    # One-shot: drop the legacy flat `trigger_debounce_seconds` field from
+    # profile subentries and seed `CONF_DEBOUNCE_CONFIG` from it when absent.
+    _migrate_legacy_debounce(hass, entry)
+
     # Clean up payload files for deleted subentries
     await hass.async_add_executor_job(_cleanup_orphaned_payloads, hass, entry)
 
@@ -306,6 +340,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Start trigger engines, then schedule staggered startup renders."""
         for coord in enabled_coords:
             await coord.async_start()
+
+        if not _STARTUP_RENDER_ENABLED:
+            _LOGGER.warning("Startup renders disabled via _STARTUP_RENDER_ENABLED")
+            return
 
         for idx, coord in enumerate(enabled_coords):
             delay = _STARTUP_RENDER_DELAY + idx * _STARTUP_RENDER_STAGGER
@@ -419,7 +457,7 @@ def _register_services(hass: HomeAssistant) -> None:
 
 _RECONFIGURE_KEYS = {
     CONF_BACKGROUND, CONF_ROTATE, CONF_DITHER, CONF_COMPRESS, CONF_MIRROR,
-    CONF_UPDATE_INTERVAL, CONF_TRIGGER_ENTITIES, CONF_DEBOUNCE,
+    CONF_UPDATE_INTERVAL, CONF_TRIGGER_ENTITIES,
     CONF_DEBOUNCE_CONFIG, CONF_RETRY_DELAY, CONF_RETRY_COUNT,
 }
 
@@ -427,26 +465,20 @@ _RECONFIGURE_KEYS = {
 async def _async_persist_subentry_data(
     hass: HomeAssistant, entry: ConfigEntry, subentry: Any, new_data: dict
 ) -> None:
-    """Persist updated subentry data via programmatic reconfigure flow.
+    """Persist updated subentry data directly via async_update_subentry.
 
-    Handles coercion (rotate int→str) required by the form schema.
-    Only passes keys accepted by _reconfigure_schema to avoid validation errors.
+    Routing through the reconfigure flow would force every persisted key
+    through the HA form schema — which excludes `debounce_config` (edited by
+    the card, not the HA form) and would reject it.
     """
-    form_data = {k: v for k, v in new_data.items() if k in _RECONFIGURE_KEYS}
-    # The reconfigure form schema expects rotate as a string (select selector)
-    if CONF_ROTATE in form_data:
-        form_data[CONF_ROTATE] = str(form_data[CONF_ROTATE])
-    _LOGGER.debug("Persisting profile settings: %s", form_data)
-    result = await hass.config_entries.subentries.async_init(
-        (entry.entry_id, "profile"),
-        context={"source": "reconfigure", "subentry_id": subentry.subentry_id},
+    filtered = {k: v for k, v in new_data.items() if k in _RECONFIGURE_KEYS}
+    merged = {**subentry.data, **filtered}
+    _LOGGER.debug("Persisting profile settings: %s", filtered)
+    hass.config_entries.async_update_subentry(entry, subentry, data=merged)
+    hass.bus.async_fire(
+        "eink_display_manager_profile_updated",
+        {"subentry_id": subentry.subentry_id},
     )
-    _LOGGER.debug("Reconfigure init result type: %s", result.get("type"))
-    if result.get("type") == "form":
-        result2 = await hass.config_entries.subentries.async_configure(
-            result["flow_id"], form_data
-        )
-        _LOGGER.debug("Reconfigure configure result type: %s", result2.get("type") if result2 else None)
 
 
 def _resolve_subentry(hass: HomeAssistant, msg: dict) -> tuple[Any, Any]:
@@ -579,9 +611,6 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 "trigger_entities": list(
                     data.get(CONF_TRIGGER_ENTITIES, [])
                 ),
-                "trigger_debounce_seconds": int(
-                    data.get(CONF_DEBOUNCE, 60)
-                ),
                 "compress": bool(data.get(CONF_COMPRESS, True)),
                 "mirror": data.get(CONF_MIRROR, "none"),
                 "debounce_config": data.get(
@@ -677,7 +706,6 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
                 CONF_MIRROR: "none",
                 CONF_UPDATE_INTERVAL: 30,
                 CONF_TRIGGER_ENTITIES: [],
-                CONF_DEBOUNCE: 60,
                 CONF_DEBOUNCE_CONFIG: {"default": 60, "global": 5, "entities": {}, "ignored": []},
             }),
             subentry_type="profile",
@@ -719,7 +747,7 @@ def _register_websocket_commands(hass: HomeAssistant) -> None:
             vol.Optional("rotate"): int,
             vol.Optional("compress"): bool,
             vol.Optional("mirror"): str,
-            vol.Optional("debounce_config"): dict,
+            vol.Optional("debounce_config"): DEBOUNCE_CONFIG_SCHEMA,
         }
     )
     @websocket_api.async_response

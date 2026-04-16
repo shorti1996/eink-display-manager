@@ -22,7 +22,6 @@ from homeassistant.helpers.selector import selector
 from .const import (
     CONF_BACKGROUND,
     CONF_COMPRESS,
-    CONF_DEBOUNCE,
     CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
     CONF_ENTITY_ID,
@@ -72,6 +71,28 @@ def _derive_title(hass: HomeAssistant, entity_id: str) -> str:
     if state and state.attributes.get("friendly_name"):
         return state.attributes["friendly_name"]
     return entity_id.replace("image.", "").replace("_", " ").title()
+
+
+_COOLDOWN_INT = vol.All(vol.Coerce(int), vol.Range(min=0))
+
+DEBOUNCE_CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Optional("default"): _COOLDOWN_INT,
+        vol.Optional("global"): _COOLDOWN_INT,
+        vol.Optional("entities"): {
+            str: vol.Any(
+                _COOLDOWN_INT,
+                vol.Schema(
+                    {
+                        vol.Optional("cooldown"): _COOLDOWN_INT,
+                        vol.Optional("max_wait"): _COOLDOWN_INT,
+                    }
+                ),
+            ),
+        },
+        vol.Optional("ignored"): [str],
+    }
+)
 
 
 def _reconfigure_schema(data: dict) -> vol.Schema:
@@ -128,9 +149,6 @@ def _reconfigure_schema(data: dict) -> vol.Schema:
                 default=data.get(CONF_TRIGGER_ENTITIES, []),
             ): selector({"entity": {"multiple": True}}),
             vol.Required(
-                CONF_DEBOUNCE, default=int(data.get(CONF_DEBOUNCE, 60))
-            ): selector({"number": {"min": 0, "max": 600, "mode": "box"}}),
-            vol.Required(
                 CONF_RETRY_DELAY, default=int(data.get(CONF_RETRY_DELAY, 5))
             ): selector({"number": {"min": 1, "max": 60, "mode": "box", "unit_of_measurement": "min"}}),
             vol.Required(
@@ -162,7 +180,6 @@ def _make_subentry_data(
         CONF_MIRROR: "none",
         CONF_UPDATE_INTERVAL: 30,
         CONF_TRIGGER_ENTITIES: [],
-        CONF_DEBOUNCE: 60,
         CONF_DEBOUNCE_CONFIG: {"default": 60, "global": 5, "entities": {}, "ignored": []},
         CONF_RETRY_DELAY: 5,
         CONF_RETRY_COUNT: 3,

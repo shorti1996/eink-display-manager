@@ -1,4 +1,18 @@
-"""Profile coordinator — trigger engine and service dispatcher."""
+"""Profile coordinator — trigger engine and service dispatcher.
+
+Log tier legend (see ``_LOGGER`` calls below):
+
+    T0  source/event arbitration  — raw event, ignore filter, bypass paths
+                                    (initial render, interval, manual force)
+    T1  per-entity debouncer      — trailing-edge cooldown + max_wait starvation
+                                    guard (``BoundedDebouncer``)
+    T2  global gate               — leading-edge cooldown shared by all entities
+                                    (HA ``Debouncer`` with ``immediate=True``)
+    T3  trigger_update            — template resolve, hash dedup, service dispatch
+
+Flow: ``T0 accept -> T1 -> T2 -> T3 dispatch``. Bypasses (initial render,
+interval, manual force) jump straight to T2 or T3.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +44,6 @@ if TYPE_CHECKING:
 from .const import (
     CONF_BACKGROUND,
     CONF_COMPRESS,
-    CONF_DEBOUNCE,
     CONF_DEBOUNCE_CONFIG,
     CONF_DITHER,
     CONF_MIRROR,
@@ -80,13 +93,15 @@ class BoundedDebouncer:
 
     def __init__(
         self, hass, logger, *, cooldown: float, max_wait: float | None = None,
-        function=None,
+        function=None, name: str = "",
     ):
         self.hass = hass
+        self._cooldown = cooldown
         self._max_wait = max_wait if max_wait is not None else cooldown * 3
         self._first_trigger: float | None = None
         self._max_wait_handle: asyncio.TimerHandle | None = None
         self._function = function
+        self._name = name
         self._inner = Debouncer(
             hass, logger, cooldown=cooldown, immediate=False,
             function=self._on_inner_fire,
@@ -96,25 +111,46 @@ class BoundedDebouncer:
         """Inner debouncer fired normally -- clean up max_wait timer and call target."""
         if self._first_trigger is None:
             return
+        elapsed = self.hass.loop.time() - self._first_trigger
         if self._max_wait_handle:
             self._max_wait_handle.cancel()
             self._max_wait_handle = None
         self._first_trigger = None
+        _LOGGER.debug(
+            "T1[%s] settled elapsed=%.2fs cooldown=%.1fs -> T2",
+            self._name, elapsed, self._cooldown,
+        )
         if self._function:
             await self._function()
 
     @callback
     def async_schedule_call(self):
+        now = self.hass.loop.time()
         if self._first_trigger is None:
-            self._first_trigger = self.hass.loop.time()
+            self._first_trigger = now
             self._max_wait_handle = self.hass.loop.call_later(
                 self._max_wait, self._force_fire,
+            )
+            _LOGGER.debug(
+                "T1[%s] arm cooldown=%.1fs max_wait=%.1fs",
+                self._name, self._cooldown, self._max_wait,
+            )
+        else:
+            elapsed = now - self._first_trigger
+            remaining_max = max(0.0, self._max_wait - elapsed)
+            _LOGGER.debug(
+                "T1[%s] reset elapsed=%.2fs cooldown=%.1fs max_wait_remaining=%.1fs",
+                self._name, elapsed, self._cooldown, remaining_max,
             )
         self._inner.async_schedule_call()
 
     @callback
     def _force_fire(self):
         """max_wait exceeded -- force fire and reset cycle."""
+        _LOGGER.warning(
+            "T1[%s] STARVATION force max_wait=%.1fs exceeded -> T2",
+            self._name, self._max_wait,
+        )
         self._inner.async_cancel()
         self._first_trigger = None
         self._max_wait_handle = None
@@ -123,6 +159,8 @@ class BoundedDebouncer:
 
     @callback
     def async_cancel(self):
+        if self._first_trigger is not None:
+            _LOGGER.debug("T1[%s] cancel (pending dropped)", self._name)
         self._inner.async_cancel()
         self._first_trigger = None
         if self._max_wait_handle:
@@ -155,14 +193,10 @@ class ProfileCoordinator:
         self.update_interval: int = int(data.get(CONF_UPDATE_INTERVAL, 0))
         self.trigger_entities: list[str] = list(data.get(CONF_TRIGGER_ENTITIES, []))
 
-        # Two-tier debounce config
-        debounce_config = data.get(CONF_DEBOUNCE_CONFIG)
-        if debounce_config is None:
-            old_debounce = int(data.get(CONF_DEBOUNCE, 60))
-            debounce_config = {**_DEBOUNCE_DEFAULTS, "default": old_debounce}
-        else:
-            debounce_config = {**_DEBOUNCE_DEFAULTS, **debounce_config}
-        self._debounce_config: dict = debounce_config
+        # Two-tier debounce config — async_setup_entry migrates legacy data
+        # so CONF_DEBOUNCE_CONFIG is guaranteed present.
+        debounce_config = data.get(CONF_DEBOUNCE_CONFIG) or {}
+        self._debounce_config: dict = {**_DEBOUNCE_DEFAULTS, **debounce_config}
         self.retry_delay: int = int(data.get(CONF_RETRY_DELAY, 5))
         self.retry_count: int = int(data.get(CONF_RETRY_COUNT, 3))
         self.compress: bool = bool(data.get(CONF_COMPRESS, True))
@@ -238,7 +272,13 @@ class ProfileCoordinator:
         """Register all triggers. Idempotent — stops existing listeners first."""
         await self.async_stop()
         if not self.enabled:
+            _LOGGER.debug("Profile %s: not starting (disabled)", self.title)
             return
+        _LOGGER.debug(
+            "Profile %s: starting triggers — interval=%dmin trigger_entities=%d global_cooldown=%ss",
+            self.title, self.update_interval, len(self.trigger_entities),
+            self._debounce_config.get("global"),
+        )
 
         # Global gate: leading-edge debouncer
         self._global_debouncer = Debouncer(
@@ -301,12 +341,20 @@ class ProfileCoordinator:
             self._global_debouncer.async_cancel()
             self._global_debouncer = None
         if self._retry_unsub:
+            _LOGGER.debug(
+                "Profile %s: T3 retry cancelled by stop (was attempt %d/%d)",
+                self.title, self._retry_attempt, self.retry_count,
+            )
             self._retry_unsub()
             self._retry_unsub = None
         self._retry_attempt = 0
 
     async def _on_interval(self, _now: datetime) -> None:
         """Handle periodic interval trigger."""
+        _LOGGER.debug(
+            "Profile %s: T0 bypass=interval (every %d min) -> dispatch",
+            self.title, self.update_interval,
+        )
         await self.async_trigger_update("interval")
 
     @callback
@@ -316,23 +364,33 @@ class ProfileCoordinator:
         """Handle template dependency change detected by HA's tracker."""
         if not self._template_init_done:
             self._template_init_done = True
+            _LOGGER.debug("Profile %s: T0 template tracker init (skip)", self.title)
             return
         if all(u.last_result == u.result for u in updates):
-            _LOGGER.debug("Profile %s: template deps fired but outputs unchanged", self.title)
+            _LOGGER.debug(
+                "Profile %s: T0 skip src=template reason=outputs_unchanged",
+                self.title,
+            )
             return
 
         if event is None:
-            # Initial render -- bypass debounce
+            _LOGGER.debug("Profile %s: T0 bypass=initial_render -> T2", self.title)
             self.hass.async_create_task(self._async_execute_update())
             return
 
         entity_id = event.data.get("entity_id")
         if not entity_id:
+            _LOGGER.debug("Profile %s: T0 skip src=template reason=no_entity_id", self.title)
             return
         if entity_id in self._debounce_config.get("ignored", []):
-            _LOGGER.debug("Profile %s: ignoring change from %s", self.title, entity_id)
+            _LOGGER.debug(
+                "Profile %s: T0 ignored src=template entity=%s", self.title, entity_id,
+            )
             return
 
+        _LOGGER.debug(
+            "Profile %s: T0 accept src=template entity=%s -> T1", self.title, entity_id,
+        )
         debouncer = self._get_or_create_entity_debouncer(entity_id)
         debouncer.async_schedule_call()
 
@@ -343,8 +401,13 @@ class ProfileCoordinator:
         if not entity_id:
             return
         if entity_id in self._debounce_config.get("ignored", []):
-            _LOGGER.debug("Profile %s: ignoring change from %s", self.title, entity_id)
+            _LOGGER.debug(
+                "Profile %s: T0 ignored src=trigger entity=%s", self.title, entity_id,
+            )
             return
+        _LOGGER.debug(
+            "Profile %s: T0 accept src=trigger entity=%s -> T1", self.title, entity_id,
+        )
         debouncer = self._get_or_create_entity_debouncer(entity_id)
         debouncer.async_schedule_call()
 
@@ -363,22 +426,35 @@ class ProfileCoordinator:
             cooldown = self._debounce_config.get("default", 5)
             max_wait = None
 
+        effective_max_wait = max_wait if max_wait is not None else cooldown * 3
+        cfg_src = "override" if entity_cfg is not None else "default"
+        _LOGGER.debug(
+            "T1[%s:%s] new cooldown=%.1fs max_wait=%.1fs src=%s",
+            self.title, entity_id, float(cooldown), float(effective_max_wait), cfg_src,
+        )
         debouncer = BoundedDebouncer(
             self.hass, _LOGGER,
             cooldown=cooldown,
             max_wait=max_wait,
-            function=self._async_request_global_refresh,
+            function=lambda: self._async_request_global_refresh(entity_id),
+            name=f"{self.title}:{entity_id}",
         )
         self._entity_debouncers[entity_id] = debouncer
         return debouncer
 
-    async def _async_request_global_refresh(self):
+    async def _async_request_global_refresh(self, entity_id: str = ""):
         """Per-entity debouncer fires here -- route through global gate."""
+        global_cooldown = self._debounce_config.get("global", 5)
+        _LOGGER.debug(
+            "Profile %s: T2 enter cooldown=%.1fs from=%s",
+            self.title, float(global_cooldown), entity_id or "?",
+        )
         if self._global_debouncer:
             await self._global_debouncer.async_call()
 
     async def _async_execute_update(self):
         """Global debouncer fires here -- the only place expensive work happens."""
+        _LOGGER.debug("Profile %s: T2 fire -> dispatch", self.title)
         await self.async_trigger_update("debounced")
 
     def get_tracked_entities(self) -> set[str]:
@@ -393,6 +469,14 @@ class ProfileCoordinator:
     def update_debounce_config(self, config: dict) -> None:
         """Hot-update debounce config -- cancel all pending, recreate global debouncer."""
         self._debounce_config = {**_DEBOUNCE_DEFAULTS, **config}
+        _LOGGER.info(
+            "Profile %s: debounce config updated default=%ss global=%ss entities=%d ignored=%d",
+            self.title,
+            self._debounce_config.get("default"),
+            self._debounce_config.get("global"),
+            len(self._debounce_config.get("entities", {})),
+            len(self._debounce_config.get("ignored", [])),
+        )
         for debouncer in self._entity_debouncers.values():
             debouncer.async_cancel()
         self._entity_debouncers.clear()
@@ -408,6 +492,10 @@ class ProfileCoordinator:
     def cancel_pending(self) -> None:
         """Cancel pending retries, debounced updates, and in-progress sends."""
         if self._retry_unsub:
+            _LOGGER.info(
+                "Profile %s: T3 retry cancelled by cancel_pending (was attempt %d/%d)",
+                self.title, self._retry_attempt, self.retry_count,
+            )
             self._retry_unsub()
             self._retry_unsub = None
         self._retry_attempt = 0
@@ -417,6 +505,10 @@ class ProfileCoordinator:
         if self._global_debouncer:
             self._global_debouncer.async_cancel()
         if self._send_task and not self._send_task.done():
+            _LOGGER.info(
+                "Profile %s: T3 in-flight send cancelled by cancel_pending",
+                self.title,
+            )
             self._send_task.cancel()
             self._send_task = None
         if self.status in ("retrying", "updating"):
@@ -425,23 +517,41 @@ class ProfileCoordinator:
     async def _on_retry(self, _now: Any) -> None:
         """Handle scheduled retry callback."""
         self._retry_unsub = None
+        _LOGGER.debug(
+            "Profile %s: T3 retry timer fired (attempt %d/%d)",
+            self.title, self._retry_attempt, self.retry_count,
+        )
         await self.async_trigger_update("retry")
 
     async def async_trigger_update(self, reason: str, *, force: bool = False) -> None:
         """Resolve templates, check hash, dispatch service call."""
         if not self.enabled:
+            _LOGGER.debug(
+                "Profile %s: T3 skip reason=%s cause=disabled", self.title, reason,
+            )
             return
 
         if self._update_lock.locked():
-            _LOGGER.debug("Profile %s: update already in progress, skipping (%s)", self.title, reason)
+            _LOGGER.debug(
+                "Profile %s: T3 skip reason=%s cause=update_in_progress",
+                self.title, reason,
+            )
             return
+
+        _LOGGER.debug(
+            "Profile %s: T3 enter reason=%s force=%s", self.title, reason, force,
+        )
 
         # A new intentional trigger supersedes any pending retry chain
         if reason != "retry":
-            self._retry_attempt = 0
             if self._retry_unsub:
+                _LOGGER.info(
+                    "Profile %s: T3 supersede reason=%s cancels pending retry (was attempt %d/%d)",
+                    self.title, reason, self._retry_attempt, self.retry_count,
+                )
                 self._retry_unsub()
                 self._retry_unsub = None
+            self._retry_attempt = 0
 
         async with self._update_lock:
             self.status = "updating"
@@ -457,11 +567,18 @@ class ProfileCoordinator:
                 payload_hash = hashlib.sha256(hash_input.encode()).hexdigest()
 
                 if payload_hash == self.last_hash and not force:
-                    _LOGGER.debug("Profile %s: no change, skipping (%s)", self.title, reason)
+                    _LOGGER.debug(
+                        "Profile %s: T3 dedup reason=%s hash=%s (no change)",
+                        self.title, reason, payload_hash[:8],
+                    )
                     self.status = "idle"
                     return
 
                 domain, service = self.service.split(".", 1)
+                _LOGGER.debug(
+                    "Profile %s: T3 dispatch service=%s.%s entity=%s reason=%s hash=%s",
+                    self.title, domain, service, self.entity_id, reason, payload_hash[:8],
+                )
                 self._send_task = self.hass.async_create_task(
                     self.hass.services.async_call(
                         domain,
@@ -489,12 +606,21 @@ class ProfileCoordinator:
                 self.last_update = datetime.now(UTC)
                 self.last_error = None
                 self.status = "idle"
+                prior_attempt = self._retry_attempt
                 self._retry_attempt = 0
-                _LOGGER.info("Profile %s: updated (%s)", self.title, reason)
+                if reason == "retry":
+                    _LOGGER.info(
+                        "Profile %s: T3 success reason=retry (recovered after attempt %d)",
+                        self.title, prior_attempt,
+                    )
+                else:
+                    _LOGGER.info("Profile %s: T3 success reason=%s", self.title, reason)
 
             except asyncio.CancelledError:
                 self.status = "idle"
-                _LOGGER.info("Profile %s: update cancelled (%s)", self.title, reason)
+                _LOGGER.info(
+                    "Profile %s: T3 cancelled reason=%s", self.title, reason,
+                )
 
             except Exception as err:  # noqa: BLE001
                 self.last_error = str(err)
@@ -506,13 +632,16 @@ class ProfileCoordinator:
                         self.hass, delay, self._on_retry
                     )
                     _LOGGER.info(
-                        "Profile %s: update failed (%s): %s — retry %d/%d in %d min",
+                        "Profile %s: T3 fail reason=%s err=%s -> retry %d/%d in %d min",
                         self.title, reason, err,
                         self._retry_attempt, self.retry_count, self.retry_delay,
                     )
                 else:
                     self.status = "error"
-                    _LOGGER.warning("Profile %s: update failed (%s): %s", self.title, reason, err)
+                    _LOGGER.warning(
+                        "Profile %s: T3 fail reason=%s err=%s -> error (retries exhausted)",
+                        self.title, reason, err,
+                    )
 
 
 def _resolve_templates(hass: HomeAssistant, payload: list[dict]) -> list[dict]:
