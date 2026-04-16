@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.13
+
+- No user-facing changes
+
+
 ## v0.2.12
 
 - docs: add detailed documentation for `eink_display_manager` (30f41ae)
